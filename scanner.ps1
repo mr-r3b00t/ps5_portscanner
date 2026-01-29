@@ -540,9 +540,18 @@ function Start-PortScan {
         $null = $Jobs.Add($Job)
     }
     
-    # Collect results
+    # Collect results with visual progress bar
     $Results = [System.Collections.ArrayList]::new()
     $StartTime = Get-Date
+    $LastProgressUpdate = Get-Date
+    $OpenPortCount = 0
+    $ProgressBarWidth = 50
+    
+    # Reserve space for progress display
+    Write-Host ""
+    Write-Host ""
+    Write-Host ""
+    $ProgressTop = [Console]::CursorTop - 3
     
     while ($Jobs.Count -gt 0) {
         $CompletedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
@@ -555,11 +564,16 @@ function Start-PortScan {
                     $Result | ForEach-Object {
                         $_ | Add-Member -NotePropertyName 'Service' -NotePropertyValue (Get-CommonPortService -Port $_.Port -Protocol $_.Protocol) -Force
                         $null = $Results.Add($_)
+                        
+                        # Track open ports for live display
+                        if ($_.Status -eq 'Open' -or $_.Status -eq 'Open|Filtered') {
+                            $OpenPortCount++
+                        }
                     }
                 }
             }
             catch {
-                Write-Warning "Error collecting result: $_"
+                # Silently continue
             }
             finally {
                 $Job.PowerShell.Dispose()
@@ -569,27 +583,75 @@ function Start-PortScan {
             $Jobs.Remove($Job)
         }
         
-        # Progress update
-        if ($TotalTasks -gt 0) {
-            $PercentComplete = [math]::Round(($CompletedCount / $TotalTasks) * 100, 1)
-            $ElapsedTime = (Get-Date) - $StartTime
-            $EstimatedTotal = if ($CompletedCount -gt 0) { 
-                [TimeSpan]::FromTicks($ElapsedTime.Ticks * $TotalTasks / $CompletedCount) 
-            } else { 
-                [TimeSpan]::Zero 
-            }
-            $Remaining = $EstimatedTotal - $ElapsedTime
+        # Update progress bar every 100ms for performance
+        $Now = Get-Date
+        if (($Now - $LastProgressUpdate).TotalMilliseconds -ge 100) {
+            $LastProgressUpdate = $Now
             
-            Write-Progress -Activity "Port Scanning" `
-                -Status "$CompletedCount of $TotalTasks tasks ($PercentComplete%)" `
-                -PercentComplete $PercentComplete `
-                -SecondsRemaining $Remaining.TotalSeconds
+            if ($TotalTasks -gt 0) {
+                $PercentComplete = [math]::Round(($CompletedCount / $TotalTasks) * 100, 1)
+                $ElapsedTime = $Now - $StartTime
+                
+                # Calculate ETA
+                $EstimatedTotal = if ($CompletedCount -gt 0) { 
+                    [TimeSpan]::FromTicks($ElapsedTime.Ticks * $TotalTasks / $CompletedCount) 
+                } else { 
+                    [TimeSpan]::Zero 
+                }
+                $Remaining = $EstimatedTotal - $ElapsedTime
+                if ($Remaining.TotalSeconds -lt 0) { $Remaining = [TimeSpan]::Zero }
+                
+                # Calculate speed
+                $Speed = if ($ElapsedTime.TotalSeconds -gt 0) {
+                    [math]::Round($CompletedCount / $ElapsedTime.TotalSeconds, 1)
+                } else { 0 }
+                
+                # Build visual progress bar (ASCII for compatibility)
+                $FilledWidth = [math]::Floor(($CompletedCount / $TotalTasks) * $ProgressBarWidth)
+                $EmptyWidth = $ProgressBarWidth - $FilledWidth
+                $ProgressBar = "[" + ("#" * $FilledWidth) + ("-" * $EmptyWidth) + "]"
+                
+                # Format time strings
+                $ElapsedStr = "{0:hh\:mm\:ss}" -f $ElapsedTime
+                $RemainingStr = "{0:hh\:mm\:ss}" -f $Remaining
+                
+                # Build progress lines
+                $Line1 = "  $ProgressBar $PercentComplete%"
+                $Line2 = "  Completed: $CompletedCount/$TotalTasks | Open Ports: $OpenPortCount | Speed: $Speed/s"
+                $Line3 = "  Elapsed: $ElapsedStr | ETA: $RemainingStr"
+                
+                # Update console display
+                try {
+                    [Console]::SetCursorPosition(0, $ProgressTop)
+                    Write-Host "$Line1$(' ' * 20)" -ForegroundColor Cyan
+                    Write-Host "$Line2$(' ' * 20)" -ForegroundColor White
+                    Write-Host "$Line3$(' ' * 20)" -ForegroundColor DarkGray
+                }
+                catch {
+                    # Fallback to Write-Progress if console manipulation fails
+                }
+                
+                # Also use Write-Progress for ISE/terminal compatibility
+                Write-Progress -Activity "Port Scanning" `
+                    -Status "$CompletedCount/$TotalTasks ($PercentComplete%) - Open: $OpenPortCount - Speed: $Speed/s" `
+                    -PercentComplete ([math]::Min($PercentComplete, 100)) `
+                    -SecondsRemaining ([math]::Max(0, $Remaining.TotalSeconds))
+            }
         }
         
         Start-Sleep -Milliseconds 50
     }
     
+    # Clear progress display
     Write-Progress -Activity "Port Scanning" -Completed
+    try {
+        [Console]::SetCursorPosition(0, $ProgressTop)
+        Write-Host "$(' ' * 80)"
+        Write-Host "$(' ' * 80)"
+        Write-Host "$(' ' * 80)"
+        [Console]::SetCursorPosition(0, $ProgressTop)
+    }
+    catch { }
     
     # Cleanup
     $RunspacePool.Close()
@@ -599,6 +661,7 @@ function Start-PortScan {
     $Duration = $EndTime - $StartTime
     
     Write-Host "`n[+] Scan completed in $($Duration.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+    Write-Host "[+] Open ports found: $OpenPortCount" -ForegroundColor Green
     
     return $Results
 }
@@ -993,9 +1056,9 @@ function New-HTMLReport {
 "@
     
     if ($HostSummary.Count -gt 0) {
-        foreach ($Host in $HostSummary) {
-            $HostIP = $Host.Name
-            $HostPorts = $Host.Group | Sort-Object Port
+        foreach ($HostEntry in $HostSummary) {
+            $HostIP = $HostEntry.Name
+            $HostPorts = $HostEntry.Group | Sort-Object Port
             
             $HTMLContent += @"
             <div class="host-section">
